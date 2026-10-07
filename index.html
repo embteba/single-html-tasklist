@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<!--
+  単一HTMLタスク管理ツール
+  ------------------------------------------------------------
+  実装意図:
+  - 本ファイル単体（HTML/CSS/JavaScript）で完結し、CDNや外部通信を一切使わず
+    file:// でもオフラインで動作することを目的とする。
+  - データモデルは「マインドマップ(ノードツリー)」を唯一の正とし、
+    ガントチャートはそのノードの start/end メタデータを描画するビューである。
+    （ガント側の操作もノードの start/end を更新するので、双方向に同期する）
+  - 永続化は JSON の Import/Export を正式な保存手段とする。
+    file:// では localStorage が使えない環境があるため、自動保存は
+    ベストエフォート（失敗しても握りつぶしてUIで明示する）とする。
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>単一HTMLタスク管理ツール</title>
+<style>
+  /* ============================================================
+     カラーテーマ: チャコール主体のシンプル配色
+     ============================================================ */
+  :root{
+    --bg:#181A1B;
+    --panel:#242729;
+    --panel-2:#2C3032;
+    --border:#3A3F42;
+    --text:#F2F2F2;
+    --text-dim:#B6BBBE;
+    --accent:#79B8AD;
+    --accent-dim:#4E7E76;
+    --danger:#C77B6B;
+    --warn:#D9B36C;
+    --radius:8px;
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; padding:0; height:100%;
+    background:var(--bg); color:var(--text);
+    font-family:-apple-system, "Segoe UI", "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
+    font-size:14px;
+  }
+  button, input, select{ font-family:inherit; font-size:inherit; }
+  button{
+    background:var(--panel-2); color:var(--text); border:1px solid var(--border);
+    border-radius:var(--radius); padding:6px 12px; cursor:pointer;
+  }
+  button:hover{ border-color:var(--accent); }
+  button:active{ transform:translateY(1px); }
+  button:disabled{ opacity:.4; cursor:not-allowed; }
+  button:focus-visible, input:focus-visible, a:focus-visible{
+    outline:2px solid var(--accent); outline-offset:1px;
+  }
+  input[type=text], input[type=date]{
+    background:var(--bg); color:var(--text); border:1px solid var(--border);
+    border-radius:6px; padding:5px 8px;
+  }
+  label{ color:var(--text-dim); font-size:12px; display:block; margin-bottom:3px; }
+  a{ color:var(--accent); }
+
+  #app{ display:flex; flex-direction:column; height:100vh; }
+
+  /* ---------- ヘッダー ---------- */
+  header#toolbar{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--border);
+  }
+  header#toolbar h1{ font-size:15px; margin:0 12px 0 0; color:var(--text-dim); font-weight:600; white-space:nowrap; }
+  #project-name{ width:220px; }
+  .spacer{ flex:1; }
+  #status-text{ color:var(--text-dim); font-size:12px; white-space:nowrap; }
+
+  /* ---------- メインワークスペース ---------- */
+  main#workspace{ flex:1; display:flex; min-height:0; }
+  @media (max-width: 900px){
+    main#workspace{ flex-direction:column; overflow-y:auto; }
+    section#mindmap-panel, section#gantt-panel{ flex:none !important; min-height:420px; }
+  }
+
+  section#mindmap-panel{
+    flex:1 1 50%; display:flex; flex-direction:column; min-width:0;
+    border-right:1px solid var(--border);
+  }
+  section#gantt-panel{
+    flex:1 1 50%; display:flex; flex-direction:column; min-width:0;
+  }
+  .panel-toolbar{
+    display:flex; align-items:center; gap:8px; padding:8px 10px;
+    background:var(--panel); border-bottom:1px solid var(--border); flex-wrap:wrap;
+  }
+  .panel-toolbar h2{ font-size:13px; margin:0 8px 0 0; color:var(--text-dim); font-weight:600; }
+
+  /* ---------- マインドマップ ---------- */
+  #mindmap-body{ flex:1; display:flex; min-height:0; }
+  #mindmap-canvas-wrap{
+    flex:1; position:relative; overflow:auto; background:var(--bg);
+    background-image: radial-gradient(var(--border) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+  #mindmap-canvas{ position:relative; width:2200px; height:1800px; }
+  #mindmap-lines{ position:absolute; top:0; left:0; pointer-events:none; }
+  .mm-node{
+    position:absolute; width:168px; min-height:50px;
+    background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius);
+    padding:6px 8px; cursor:grab; user-select:none;
+  }
+  .mm-node.root{ border-color:var(--accent); background:#2A3C39; }
+  .mm-node.selected{ outline:2px solid var(--accent); }
+  .mm-node .mm-name{
+    font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .mm-node .mm-dates{ font-size:11px; color:var(--text-dim); margin-top:3px; }
+  .mm-node .mm-dates.scheduled{ color:var(--accent); }
+  .mm-node .mm-dates.partial{ color:var(--warn); }
+
+  aside#detail-panel{
+    width:240px; flex:none; background:var(--panel); border-left:1px solid var(--border);
+    padding:12px; overflow-y:auto;
+  }
+  aside#detail-panel h3{ font-size:13px; margin:0 0 10px; color:var(--text-dim); }
+  .field{ margin-bottom:12px; }
+  .field input[type=text]{ width:100%; }
+  .field-row{ display:flex; gap:8px; }
+  .field-row .field{ flex:1; }
+  #detail-empty{ color:var(--text-dim); font-size:12px; }
+  .detail-actions{ display:flex; flex-direction:column; gap:6px; margin-top:14px; }
+  .detail-actions button{ width:100%; }
+  #btn-delete-node{ border-color:var(--danger); color:var(--danger); }
+  #btn-delete-node:hover{ background:var(--danger); color:#fff; }
+  .field-error{ color:var(--danger); font-size:11px; margin-top:3px; min-height:14px; }
+  .field-hint{ color:var(--text-dim); font-size:11px; margin-top:3px; }
+
+  /* ---------- ガントチャート ---------- */
+  #unscheduled-wrap{
+    flex:none; padding:8px 10px; background:var(--panel); border-bottom:1px solid var(--border);
+    max-height:120px; overflow-y:auto;
+  }
+  #unscheduled-wrap h2{ font-size:12px; margin:0 0 6px; color:var(--text-dim); }
+  #unscheduled-list{ display:flex; flex-wrap:wrap; gap:6px; }
+  .task-card{
+    background:var(--panel-2); border:1px dashed var(--border); border-radius:6px;
+    padding:5px 9px; font-size:12px; cursor:grab; user-select:none;
+  }
+  .task-card:hover{ border-color:var(--accent); }
+  .task-card .tc-note{ color:var(--warn); font-size:10px; margin-top:2px; }
+  #unscheduled-empty{ color:var(--text-dim); font-size:12px; }
+
+  #gantt-scroll-outer{ flex:1; overflow:auto; position:relative; background:var(--bg); }
+  #gantt-content{ position:relative; }
+  .gantt-header{ display:flex; position:sticky; top:0; z-index:3; background:var(--panel); }
+  .gantt-label-spacer{
+    position:sticky; left:0; z-index:4; width:180px; flex:none;
+    background:var(--panel); border-right:1px solid var(--border); border-bottom:1px solid var(--border);
+  }
+  .gantt-header-dates{ position:relative; border-bottom:1px solid var(--border); }
+  .gantt-day-cell{
+    position:absolute; top:0; height:36px; border-right:1px solid var(--border);
+    font-size:10px; color:var(--text-dim); text-align:center; padding-top:4px;
+    display:flex; flex-direction:column; justify-content:center;
+  }
+  .gantt-day-cell.weekend{ background:rgba(255,255,255,0.03); }
+  .gantt-day-cell.today{ background:rgba(121,184,173,0.18); color:var(--accent); font-weight:700; }
+
+  .gantt-row{ display:flex; }
+  .gantt-row-label{
+    position:sticky; left:0; z-index:2; width:180px; flex:none;
+    background:var(--panel); border-right:1px solid var(--border); border-bottom:1px solid var(--border);
+    padding:8px 10px; font-size:12px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .gantt-row-label:hover{ color:var(--accent); }
+  .gantt-row-label.selected{ color:var(--accent); font-weight:700; }
+  .gantt-track{ position:relative; height:40px; border-bottom:1px solid var(--border); overflow:hidden; }
+  .gantt-bar{
+    position:absolute; top:6px; height:28px; border-radius:6px;
+    background:var(--accent-dim); border:1px solid var(--accent);
+    display:flex; align-items:center; overflow:hidden; cursor:grab;
+  }
+  .gantt-bar .gb-label{ font-size:11px; padding:0 8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#fff; }
+  .gantt-bar .gb-handle{
+    position:absolute; top:0; bottom:0; width:8px; cursor:ew-resize;
+    background:rgba(255,255,255,0.12);
+  }
+  .gantt-bar .gb-handle.left{ left:0; }
+  .gantt-bar .gb-handle.right{ right:0; }
+
+  #gantt-drop-overlay{
+    position:absolute; top:0; height:100%; pointer-events:none; z-index:5;
+  }
+  #gantt-drop-overlay.active{ pointer-events:auto; cursor:copy; }
+  #gantt-drop-highlight{
+    position:absolute; top:0; height:100%; width:34px; background:rgba(121,184,173,0.25);
+    border-left:1px solid var(--accent); border-right:1px solid var(--accent);
+    display:none; pointer-events:none;
+  }
+
+  .mm-ghost, .gantt-ghost{
+    position:fixed; z-index:1000; pointer-events:none; opacity:.85;
+    background:var(--panel-2); border:1px solid var(--accent); border-radius:6px;
+    padding:5px 9px; font-size:12px; color:var(--text);
+  }
+
+  /* ---------- インポートエラー ---------- */
+  #import-errors{
+    display:none; position:fixed; right:16px; bottom:16px; max-width:420px;
+    background:var(--panel); border:1px solid var(--danger); border-radius:var(--radius);
+    padding:12px 14px; z-index:2000; box-shadow:0 4px 16px rgba(0,0,0,.4);
+  }
+  #import-errors h3{ margin:0 0 8px; color:var(--danger); font-size:13px; }
+  #import-errors ul{ margin:0 0 10px; padding-left:18px; font-size:12px; color:var(--text-dim); }
+  #import-errors button{ float:right; }
+
+  footer#status-bar{
+    flex:none; padding:4px 14px; background:var(--panel); border-top:1px solid var(--border);
+    color:var(--text-dim); font-size:11px;
+  }
+  .hidden{ display:none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ============== ヘッダー: プロジェクト名 / Import / Export ============== -->
+  <header id="toolbar">
+    <h1>タスク管理ツール</h1>
+    <div class="field" style="margin:0;">
+      <input type="text" id="project-name" value="新しいプロジェクト" aria-label="プロジェクト名">
+    </div>
+    <div class="spacer"></div>
+    <button id="btn-import">Import (JSON)</button>
+    <input type="file" id="file-input" accept="application/json,.json" class="hidden">
+    <button id="btn-export">Export (JSON)</button>
+    <span id="status-text">読み込み中…</span>
+  </header>
+
+  <main id="workspace">
+
+    <!-- ============== マインドマップ パネル ============== -->
+    <section id="mindmap-panel">
+      <div class="panel-toolbar">
+        <h2>マインドマップ</h2>
+        <button id="btn-add-child" title="選択中のノードに子ノードを追加します">＋ 子ノードを追加</button>
+        <span class="field-hint" style="margin-left:4px;">ノードはドラッグで移動できます</span>
+      </div>
+      <div id="mindmap-body">
+        <div id="mindmap-canvas-wrap">
+          <div id="mindmap-canvas">
+            <svg id="mindmap-lines" width="2200" height="1800"></svg>
+            <!-- ノード要素はJSで動的生成 -->
+          </div>
+        </div>
+        <aside id="detail-panel">
+          <h3>ノード詳細</h3>
+          <div id="detail-empty">ノードを選択してください。</div>
+          <div id="detail-form" class="hidden">
+            <div class="field">
+              <label for="d-name">名前</label>
+              <input type="text" id="d-name" maxlength="200">
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="d-start">開始日</label>
+                <input type="date" id="d-start">
+              </div>
+              <div class="field">
+                <label for="d-end">終了日</label>
+                <input type="date" id="d-end">
+              </div>
+            </div>
+            <div class="field-error" id="d-date-error"></div>
+            <div class="field-hint" id="d-root-hint"></div>
+            <div class="detail-actions">
+              <button id="btn-add-child-2">＋ 子ノードを追加</button>
+              <button id="btn-delete-node">🗑 このノードを削除</button>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============== ガントチャート パネル ============== -->
+    <section id="gantt-panel">
+      <div class="panel-toolbar">
+        <h2>ガントチャート</h2>
+        <button id="btn-gantt-prev" title="表示期間を前に移動">◀ 前の期間</button>
+        <button id="btn-gantt-today" title="今日を含む期間に戻る">今日</button>
+        <button id="btn-gantt-next" title="表示期間を後ろに移動">次の期間 ▶</button>
+        <span class="field-hint" id="gantt-range-label" style="margin-left:4px;"></span>
+        <span class="field-hint" id="gantt-offscreen-note" style="margin-left:4px; color:var(--warn);"></span>
+      </div>
+      <div id="unscheduled-wrap">
+        <h2>未日程タスク</h2>
+        <div id="unscheduled-list"></div>
+      </div>
+      <div id="gantt-scroll-outer">
+        <div id="gantt-content">
+          <div class="gantt-header">
+            <div class="gantt-label-spacer"></div>
+            <div class="gantt-header-dates" id="gantt-header-dates"></div>
+          </div>
+          <div id="gantt-rows"></div>
+          <div id="gantt-drop-overlay">
+            <div id="gantt-drop-highlight"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer id="status-bar">file:// でも完全オフラインで動作します（外部通信なし）。</footer>
+</div>
+
+<!-- インポート検証エラー表示 -->
+<div id="import-errors">
+  <h3>インポートに失敗しました</h3>
+  <ul id="import-errors-list"></ul>
+  <button id="btn-close-import-errors">閉じる</button>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ============================================================
+     定数
+     ============================================================ */
+  var NODE_W = 168, NODE_H = 50;
+  var LEVEL_GAP_X = 220, CHILD_GAP_Y = 68;
+  var DAY_WIDTH = 34;
+  var LABEL_COL_WIDTH = 180;
+  var ROW_HEIGHT = 40;
+  var STORAGE_KEY = "single-html-tasklist.v1";
+
+  /* ============================================================
+     日付ユーティリティ（UTC固定でDST/タイムゾーンのズレを回避）
+     ============================================================ */
+  function pad2(n){ return n < 10 ? "0"+n : ""+n; }
+  function todayISO(){
+    var d = new Date();
+    return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate());
+  }
+  function isValidISODate(s){
+    if (typeof s !== "string") return false;
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (!m) return false;
+    var y = +m[1], mo = +m[2], d = +m[3];
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+    var dt = new Date(Date.UTC(y, mo-1, d));
+    return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo-1 && dt.getUTCDate() === d;
+  }
+  function parseUTC(s){
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    return Date.UTC(+m[1], +m[2]-1, +m[3]);
+  }
+  function diffDays(a, b){ return Math.round((parseUTC(b) - parseUTC(a)) / 86400000); }
+  function addDaysISO(s, n){
+    var t = parseUTC(s) + n * 86400000;
+    var dt = new Date(t);
+    return dt.getUTCFullYear()+"-"+pad2(dt.getUTCMonth()+1)+"-"+pad2(dt.getUTCDate());
+  }
+  function isoWeekday(s){ // 0=日,6=土 (UTCベース)
+    return new Date(parseUTC(s)).getUTCDay();
+  }
+
+  function uid(){
+    return "n_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 9);
+  }
+
+  /* ============================================================
+     状態 (State) : マインドマップのノードツリーが唯一の正データ。
+     ガントチャートはこの state.nodes を描画するビューであり、
+     ガント側の操作も最終的に node.start / node.end を書き換える。
+     ============================================================ */
+  var state = null;
+  var selectedId = null;
+  // ガントは「固定長の表示ウィンドウ」のみをDOM化する。
+  // インポートされた日付がどれほど極端に離れていても(例: 遠い未来/過去)、
+  // 一度に生成する日付セルの数を GANTT_WINDOW_DAYS に固定することで、
+  // DOMが無制限に増えてブラウザが固まるのを防ぐ。
+  // 日付データ自体を切り捨てることはせず、前後移動ボタンでウィンドウを
+  // パン(移動)して任意の期間を閲覧できるようにする。
+  var GANTT_WINDOW_DAYS = 180;
+  var ganttWindowStart = null; // ISO date string、null時は初回描画時に自動計算
+
+  function defaultState(){
+    var rootId = uid();
+    return {
+      schemaVersion: 1,
+      project: { name: "新しいプロジェクト" },
+      nodes: [
+        { id: rootId, parentId: null, name: "プロジェクトルート", start: null, end: null, x: 40, y: 260 }
+      ]
+    };
+  }
+
+  function findNode(id){
+    for (var i = 0; i < state.nodes.length; i++) if (state.nodes[i].id === id) return state.nodes[i];
+    return null;
+  }
+  function children(id){
+    return state.nodes.filter(function(n){ return n.parentId === id; });
+  }
+  function rootNode(){
+    for (var i = 0; i < state.nodes.length; i++) if (state.nodes[i].parentId === null) return state.nodes[i];
+    return null;
+  }
+  function depthOf(node){
+    var d = 0, cur = node;
+    var guard = 0;
+    while (cur && cur.parentId && guard < 10000) {
+      cur = findNode(cur.parentId);
+      d++; guard++;
+    }
+    return d;
+  }
+  function descendantIds(id){
+    var out = [];
+    var stack = [id];
+    while (stack.length) {
+      var cur = stack.pop();
+      children(cur).forEach(function(c){ out.push(c.id); stack.push(c.id); });
+    }
+    return out;
+  }
+
+  /* ============================================================
+     永続化: localStorage へのベストエフォート自動保存 + JSON Import/Export
+     ============================================================ */
+  var localStorageAvailable = true;
+  function trySaveLocal(){
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      localStorageAvailable = true;
+    } catch (e) {
+      localStorageAvailable = false;
+    }
+    updateStatusText();
+  }
+  function tryLoadLocal(){
+    try {
+      var raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      var errors = validateState(parsed);
+      if (errors.length) return null;
+      return parsed;
+    } catch (e) {
+      return null;
+    }
+  }
+  function updateStatusText(){
+    var el = document.getElementById("status-text");
+    el.textContent = localStorageAvailable
+      ? "自動保存: 有効 (ブラウザ内)"
+      : "自動保存: 無効 (file://等の制限 - Exportで保存してください)";
+  }
+
+  /* ---- バリデーション (Import 兼 localStorage 読込で共用) ---- */
+  function validateState(obj){
+    var errors = [];
+    if (!obj || typeof obj !== "object") { errors.push("JSONがオブジェクトではありません。"); return errors; }
+    if (typeof obj.schemaVersion !== "number") errors.push("schemaVersion が数値ではありません。");
+    if (!obj.project || typeof obj.project.name !== "string") errors.push("project.name が文字列ではありません。");
+    if (!Array.isArray(obj.nodes)) { errors.push("nodes が配列ではありません。"); return errors; }
+    if (obj.nodes.length === 0) { errors.push("nodes が空です（ルートノードが必要です）。"); return errors; }
+
+    var ids = {};
+    var rootCount = 0;
+    obj.nodes.forEach(function(n, i){
+      if (!n || typeof n !== "object") { errors.push("nodes[" + i + "] がオブジェクトではありません。"); return; }
+      if (typeof n.id !== "string" || !n.id) { errors.push("nodes[" + i + "].id が不正です。"); return; }
+      if (ids[n.id]) errors.push("id の重複: " + n.id);
+      ids[n.id] = true;
+      if (typeof n.name !== "string") errors.push("nodes[" + i + "].name が文字列ではありません。(id=" + n.id + ")");
+      if (n.parentId !== null && typeof n.parentId !== "string") errors.push("nodes[" + i + "].parentId が不正です。(id=" + n.id + ")");
+      if (n.parentId === null) rootCount++;
+      if (n.start !== null && n.start !== undefined && !isValidISODate(n.start)) errors.push("start の日付形式が不正です。(id=" + n.id + ")");
+      if (n.end !== null && n.end !== undefined && !isValidISODate(n.end)) errors.push("end の日付形式が不正です。(id=" + n.id + ")");
+      if (n.start && n.end && isValidISODate(n.start) && isValidISODate(n.end) && n.start > n.end) {
+        errors.push("start が end より後になっています。(id=" + n.id + ")");
+      }
+      if (typeof n.x !== "number" || typeof n.y !== "number") errors.push("nodes[" + i + "].x/y が数値ではありません。(id=" + n.id + ")");
+    });
+    if (errors.length) return errors;
+
+    if (rootCount !== 1) errors.push("ルートノード(parentId=null)は1つである必要があります（現在:" + rootCount + "）。");
+
+    // 親参照の存在確認
+    obj.nodes.forEach(function(n){
+      if (n.parentId !== null && !ids[n.parentId]) errors.push("存在しない parentId を参照しています。(id=" + n.id + ", parentId=" + n.parentId + ")");
+    });
+    if (errors.length) return errors;
+
+    // 循環参照の検出
+    var byId = {};
+    obj.nodes.forEach(function(n){ byId[n.id] = n; });
+    obj.nodes.forEach(function(n){
+      var seen = {};
+      var cur = n;
+      var guard = 0;
+      while (cur && cur.parentId !== null && guard < obj.nodes.length + 5) {
+        if (seen[cur.id]) { errors.push("循環参照を検出しました。(id=" + n.id + ")"); break; }
+        seen[cur.id] = true;
+        cur = byId[cur.parentId];
+        guard++;
+      }
+    });
+    return errors;
+  }
+
+  function doExport(){
+    var name = (state.project.name || "project").trim() || "project";
+    var safe = name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+    var blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = safe + "-tasklist.json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function showImportErrors(errors){
+    var box = document.getElementById("import-errors");
+    var list = document.getElementById("import-errors-list");
+    list.innerHTML = "";
+    errors.forEach(function(msg){
+      var li = document.createElement("li");
+      li.textContent = msg; // textContent のみ使用し、HTML注入を防止
+      list.appendChild(li);
+    });
+    box.style.display = "block";
+  }
+
+  function doImport(file){
+    var reader = new FileReader();
+    reader.onload = function(){
+      var parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch (e) {
+        showImportErrors(["JSONの構文解析に失敗しました: " + e.message]);
+        return;
+      }
+      var errors = validateState(parsed);
+      if (errors.length) {
+        showImportErrors(errors);
+        return; // 既存状態は維持する
+      }
+      state = parsed;
+      selectedId = null;
+      ganttWindowStart = null; // インポート後は新データに合わせてウィンドウを再計算
+      render();
+    };
+    reader.onerror = function(){
+      showImportErrors(["ファイルの読み込みに失敗しました。"]);
+    };
+    reader.readAsText(file, "utf-8");
+  }
+
+  /* ============================================================
+     ポインタドラッグ共通ヘルパー
+     ============================================================ */
+  function startPointerDrag(downEvent, handlers){
+    var moved = false;
+    var startX = downEvent.clientX, startY = downEvent.clientY;
+    function onMove(e){
+      var dx = e.clientX - startX, dy = e.clientY - startY;
+      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+      if (handlers.onMove) handlers.onMove(e, dx, dy, moved);
+    }
+    function onUp(e){
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      if (handlers.onEnd) handlers.onEnd(e, moved);
+    }
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  }
+
+  /* ============================================================
+     レンダリング: 全体
+     ============================================================ */
+  function render(){
+    document.getElementById("project-name").value = state.project.name;
+    renderMindmap();
+    renderGanttUnscheduled();
+    renderGantt();
+    renderDetail();
+    trySaveLocal();
+  }
+
+  /* ---------------- マインドマップ描画 ---------------- */
+  function renderMindmap(){
+    var canvas = document.getElementById("mindmap-canvas");
+    // 既存ノードDOMを除去（SVGは残す）
+    canvas.querySelectorAll(".mm-node").forEach(function(el){ el.remove(); });
+
+    state.nodes.forEach(function(node){
+      var el = document.createElement("div");
+      el.className = "mm-node" + (node.parentId === null ? " root" : "") + (node.id === selectedId ? " selected" : "");
+      el.style.left = node.x + "px";
+      el.style.top = node.y + "px";
+      el.dataset.id = node.id;
+
+      var nameEl = document.createElement("div");
+      nameEl.className = "mm-name";
+      nameEl.textContent = node.name;
+      el.appendChild(nameEl);
+
+      if (node.parentId !== null) {
+        var dateEl = document.createElement("div");
+        var hasStart = !!node.start, hasEnd = !!node.end;
+        if (hasStart && hasEnd) {
+          dateEl.className = "mm-dates scheduled";
+          dateEl.textContent = node.start + " 〜 " + node.end;
+        } else if (hasStart || hasEnd) {
+          dateEl.className = "mm-dates partial";
+          dateEl.textContent = "一部日程設定 (" + (hasStart ? node.start : node.end) + ")";
+        } else {
+          dateEl.className = "mm-dates";
+          dateEl.textContent = "未日程";
+        }
+        el.appendChild(dateEl);
+      }
+
+      el.addEventListener("pointerdown", function(downEvent){
+        if (downEvent.button !== 0) return;
+        downEvent.preventDefault();
+        var origX = node.x, origY = node.y;
+        startPointerDrag(downEvent, {
+          onMove: function(e, dx, dy, moved){
+            if (!moved) return;
+            node.x = origX + dx;
+            node.y = origY + dy;
+            el.style.left = node.x + "px";
+            el.style.top = node.y + "px";
+            drawMindmapLines();
+          },
+          onEnd: function(e, moved){
+            if (!moved) {
+              selectedId = node.id;
+              render();
+            } else {
+              render();
+            }
+          }
+        });
+      });
+
+      canvas.appendChild(el);
+    });
+
+    drawMindmapLines();
+  }
+
+  function drawMindmapLines(){
+    var svg = document.getElementById("mindmap-lines");
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    state.nodes.forEach(function(node){
+      if (node.parentId === null) return;
+      var parent = findNode(node.parentId);
+      if (!parent) return;
+      var x1 = parent.x + NODE_W, y1 = parent.y + NODE_H / 2;
+      var x2 = node.x, y2 = node.y + NODE_H / 2;
+      var midX = (x1 + x2) / 2;
+      var path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      var d = "M " + x1 + " " + y1 + " C " + midX + " " + y1 + ", " + midX + " " + y2 + ", " + x2 + " " + y2;
+      path.setAttribute("d", d);
+      path.setAttribute("stroke", "#3A3F42");
+      path.setAttribute("stroke-width", "2");
+      path.setAttribute("fill", "none");
+      svg.appendChild(path);
+    });
+  }
+
+  /* ---------------- 詳細パネル ---------------- */
+  function renderDetail(){
+    var empty = document.getElementById("detail-empty");
+    var form = document.getElementById("detail-form");
+    var node = selectedId ? findNode(selectedId) : null;
+    if (!node) {
+      empty.classList.remove("hidden");
+      form.classList.add("hidden");
+      return;
+    }
+    empty.classList.add("hidden");
+    form.classList.remove("hidden");
+
+    var isRoot = node.parentId === null;
+    document.getElementById("d-name").value = node.name;
+    var startInput = document.getElementById("d-start");
+    var endInput = document.getElementById("d-end");
+    startInput.value = node.start || "";
+    endInput.value = node.end || "";
+    startInput.disabled = isRoot;
+    endInput.disabled = isRoot;
+    document.getElementById("d-root-hint").textContent = isRoot
+      ? "ルートノードには開始・終了日を設定できません。"
+      : "";
+    document.getElementById("d-date-error").textContent = "";
+    document.getElementById("btn-delete-node").disabled = isRoot;
+
+    // ガント側の選択ハイライトも更新
+    document.querySelectorAll(".gantt-row-label").forEach(function(el){
+      el.classList.toggle("selected", el.dataset.id === selectedId);
+    });
+  }
+
+  function commitNameChange(){
+    var node = selectedId ? findNode(selectedId) : null;
+    if (!node) return;
+    var v = document.getElementById("d-name").value;
+    node.name = v.slice(0, 200);
+    renderMindmap();
+    renderGanttUnscheduled();
+    renderGantt();
+    trySaveLocal();
+  }
+
+  function commitDateChange(){
+    var node = selectedId ? findNode(selectedId) : null;
+    if (!node || node.parentId === null) return;
+    var s = document.getElementById("d-start").value || null;
+    var e = document.getElementById("d-end").value || null;
+    var errEl = document.getElementById("d-date-error");
+    if (s && e && s > e) {
+      errEl.textContent = "開始日は終了日以前にしてください。";
+      // 既存値に戻す
+      document.getElementById("d-start").value = node.start || "";
+      document.getElementById("d-end").value = node.end || "";
+      return;
+    }
+    errEl.textContent = "";
+    node.start = s;
+    node.end = e;
+    render();
+  }
+
+  function addChildToSelected(){
+    var parent = selectedId ? findNode(selectedId) : rootNode();
+    if (!parent) return;
+    var existingChildren = children(parent.id);
+    var newNode = {
+      id: uid(),
+      parentId: parent.id,
+      name: "新しいタスク",
+      start: null,
+      end: null,
+      x: parent.x + LEVEL_GAP_X,
+      y: parent.y + existingChildren.length * CHILD_GAP_Y
+    };
+    state.nodes.push(newNode);
+    selectedId = newNode.id;
+    render();
+  }
+
+  function deleteSelected(){
+    var node = selectedId ? findNode(selectedId) : null;
+    if (!node || node.parentId === null) return;
+    var ids = descendantIds(node.id).concat([node.id]);
+    var ok = window.confirm("「" + node.name + "」と配下の " + (ids.length - 1) + " 件の子孫ノードを削除します。よろしいですか？");
+    if (!ok) return;
+    state.nodes = state.nodes.filter(function(n){ return ids.indexOf(n.id) === -1; });
+    selectedId = null;
+    render();
+  }
+
+  /* ---------------- ガントチャート: 範囲計算 ---------------- */
+  // 表示ウィンドウは常に GANTT_WINDOW_DAYS 日分だけをDOM化する(固定長)。
+  // これにより、インポートされた日付がどれほど極端でも生成されるDOM数は
+  // 一定に保たれる。初回描画時のみ、今日/スケジュール済みタスクの最早日を
+  // 考慮した開始位置を自動計算する。
+  function initialWindowStart(){
+    var today = todayISO();
+    var minS = today;
+    state.nodes.forEach(function(n){
+      if (n.start && n.start < minS) minS = n.start;
+    });
+    return addDaysISO(minS, -7);
+  }
+  function computeGanttRange(){
+    if (ganttWindowStart === null) ganttWindowStart = initialWindowStart();
+    var start = ganttWindowStart;
+    var end = addDaysISO(start, GANTT_WINDOW_DAYS - 1);
+    return { start: start, end: end };
+  }
+  function shiftGanttWindow(deltaDays){
+    if (ganttWindowStart === null) ganttWindowStart = initialWindowStart();
+    ganttWindowStart = addDaysISO(ganttWindowStart, deltaDays);
+    renderGantt();
+  }
+  function resetGanttWindowToToday(){
+    ganttWindowStart = addDaysISO(todayISO(), -7);
+    renderGantt();
+  }
+
+  /* ---------------- ガントチャート: 未日程リスト ---------------- */
+  function renderGanttUnscheduled(){
+    var list = document.getElementById("unscheduled-list");
+    list.innerHTML = "";
+    var items = state.nodes.filter(function(n){ return n.parentId !== null && !(n.start && n.end); });
+    if (items.length === 0) {
+      var empty = document.createElement("div");
+      empty.id = "unscheduled-empty";
+      empty.textContent = "未日程のタスクはありません。";
+      list.appendChild(empty);
+      return;
+    }
+    items.forEach(function(node){
+      var card = document.createElement("div");
+      card.className = "task-card";
+      card.dataset.id = node.id;
+      var nameEl = document.createElement("div");
+      nameEl.textContent = node.name;
+      card.appendChild(nameEl);
+      if (node.start || node.end) {
+        var note = document.createElement("div");
+        note.className = "tc-note";
+        note.textContent = node.start ? ("開始日のみ設定: " + node.start) : ("終了日のみ設定: " + node.end);
+        card.appendChild(note);
+      }
+      card.addEventListener("pointerdown", function(downEvent){
+        if (downEvent.button !== 0) return;
+        downEvent.preventDefault();
+        beginUnscheduledDrag(downEvent, node);
+      });
+      list.appendChild(card);
+    });
+  }
+
+  function beginUnscheduledDrag(downEvent, node){
+    var ghost = document.createElement("div");
+    ghost.className = "gantt-ghost";
+    ghost.textContent = node.name;
+    ghost.style.left = downEvent.clientX + 10 + "px";
+    ghost.style.top = downEvent.clientY + 10 + "px";
+    document.body.appendChild(ghost);
+
+    var overlay = document.getElementById("gantt-drop-overlay");
+    var highlight = document.getElementById("gantt-drop-highlight");
+    overlay.classList.add("active");
+    var overlayRect = overlay.getBoundingClientRect();
+    var range = computeGanttRange();
+
+    function dateFromX(clientX){
+      var x = clientX - overlayRect.left;
+      if (x < 0 || x > overlayRect.width) return null;
+      var dayIndex = Math.floor(x / DAY_WIDTH);
+      return addDaysISO(range.start, dayIndex);
+    }
+
+    startPointerDrag(downEvent, {
+      onMove: function(e){
+        ghost.style.left = e.clientX + 10 + "px";
+        ghost.style.top = e.clientY + 10 + "px";
+        var inBounds = e.clientX >= overlayRect.left && e.clientX <= overlayRect.right &&
+                        e.clientY >= overlayRect.top && e.clientY <= overlayRect.bottom;
+        if (inBounds) {
+          var dayIndex = Math.floor((e.clientX - overlayRect.left) / DAY_WIDTH);
+          highlight.style.left = (dayIndex * DAY_WIDTH) + "px";
+          highlight.style.display = "block";
+        } else {
+          highlight.style.display = "none";
+        }
+      },
+      onEnd: function(e){
+        ghost.remove();
+        overlay.classList.remove("active");
+        highlight.style.display = "none";
+        var date = dateFromX(e.clientX);
+        if (date && e.clientY >= overlayRect.top && e.clientY <= overlayRect.bottom) {
+          node.start = date;
+          node.end = date;
+          render();
+        }
+      }
+    });
+  }
+
+  /* ---------------- ガントチャート: 本体描画 ---------------- */
+  function renderGantt(){
+    var range = computeGanttRange();
+    var totalDays = diffDays(range.start, range.end) + 1;
+    var totalWidth = totalDays * DAY_WIDTH;
+    var today = todayISO();
+
+    // ヘッダー（日付セル）
+    var headerDates = document.getElementById("gantt-header-dates");
+    headerDates.innerHTML = "";
+    headerDates.style.width = totalWidth + "px";
+    headerDates.style.height = "36px";
+    for (var i = 0; i < totalDays; i++) {
+      var dateStr = addDaysISO(range.start, i);
+      var wd = isoWeekday(dateStr);
+      var cell = document.createElement("div");
+      cell.className = "gantt-day-cell" + ((wd === 0 || wd === 6) ? " weekend" : "") + (dateStr === today ? " today" : "");
+      cell.style.left = (i * DAY_WIDTH) + "px";
+      cell.style.width = DAY_WIDTH + "px";
+      var d = new Date(parseUTC(dateStr));
+      var label = (d.getUTCMonth() + 1) + "/" + d.getUTCDate();
+      cell.textContent = label;
+      headerDates.appendChild(cell);
+    }
+
+    // 期間ラベル表示
+    document.getElementById("gantt-range-label").textContent = "表示期間: " + range.start + " 〜 " + range.end;
+
+    // 行（スケジュール済みタスク） - 現在のウィンドウと重なるものだけをDOM化する
+    var rowsWrap = document.getElementById("gantt-rows");
+    rowsWrap.innerHTML = "";
+    var allScheduled = state.nodes.filter(function(n){ return n.parentId !== null && n.start && n.end; });
+    var scheduled = allScheduled.filter(function(n){
+      return n.start <= range.end && n.end >= range.start;
+    });
+    var offscreenCount = allScheduled.length - scheduled.length;
+    document.getElementById("gantt-offscreen-note").textContent = offscreenCount > 0
+      ? ("表示期間外のスケジュール済みタスク: " + offscreenCount + "件（前後の期間ボタンで移動できます）")
+      : "";
+
+    scheduled.forEach(function(node){
+      var row = document.createElement("div");
+      row.className = "gantt-row";
+
+      var label = document.createElement("div");
+      label.className = "gantt-row-label" + (node.id === selectedId ? " selected" : "");
+      label.textContent = node.name;
+      label.dataset.id = node.id;
+      label.addEventListener("click", function(){
+        selectedId = node.id;
+        render();
+      });
+      row.appendChild(label);
+
+      var track = document.createElement("div");
+      track.className = "gantt-track";
+      track.style.width = totalWidth + "px";
+
+      var bar = document.createElement("div");
+      bar.className = "gantt-bar";
+      var offset = diffDays(range.start, node.start);
+      var span = diffDays(node.start, node.end) + 1;
+      bar.style.left = (offset * DAY_WIDTH) + "px";
+      bar.style.width = (span * DAY_WIDTH - 2) + "px";
+
+      var handleL = document.createElement("div");
+      handleL.className = "gb-handle left";
+      var handleR = document.createElement("div");
+      handleR.className = "gb-handle right";
+      var gbLabel = document.createElement("div");
+      gbLabel.className = "gb-label";
+      gbLabel.textContent = node.name;
+
+      bar.appendChild(handleL);
+      bar.appendChild(gbLabel);
+      bar.appendChild(handleR);
+
+      // バー本体のドラッグ = 開始・終了日を同じ日数分シフト
+      gbLabel.addEventListener("pointerdown", function(downEvent){
+        if (downEvent.button !== 0) return;
+        downEvent.preventDefault();
+        downEvent.stopPropagation();
+        var origStart = node.start, origEnd = node.end;
+        var origLeft = offset * DAY_WIDTH;
+        startPointerDrag(downEvent, {
+          onMove: function(e, dx, dy, moved){
+            if (!moved) return;
+            var deltaDays = Math.round(dx / DAY_WIDTH);
+            bar.style.left = (origLeft + deltaDays * DAY_WIDTH) + "px";
+          },
+          onEnd: function(e, moved){
+            if (!moved) {
+              selectedId = node.id;
+              render();
+              return;
+            }
+            var dx = e.clientX - downEvent.clientX;
+            var deltaDays = Math.round(dx / DAY_WIDTH);
+            node.start = addDaysISO(origStart, deltaDays);
+            node.end = addDaysISO(origEnd, deltaDays);
+            selectedId = node.id;
+            render();
+          }
+        });
+      });
+
+      // 左ハンドル = 開始日のみ変更
+      handleL.addEventListener("pointerdown", function(downEvent){
+        if (downEvent.button !== 0) return;
+        downEvent.preventDefault();
+        downEvent.stopPropagation();
+        startPointerDrag(downEvent, {
+          onEnd: function(e){
+            var dx = e.clientX - downEvent.clientX;
+            var deltaDays = Math.round(dx / DAY_WIDTH);
+            var candidate = addDaysISO(node.start, deltaDays);
+            if (candidate > node.end) candidate = node.end;
+            node.start = candidate;
+            selectedId = node.id;
+            render();
+          }
+        });
+      });
+
+      // 右ハンドル = 終了日のみ変更
+      handleR.addEventListener("pointerdown", function(downEvent){
+        if (downEvent.button !== 0) return;
+        downEvent.preventDefault();
+        downEvent.stopPropagation();
+        startPointerDrag(downEvent, {
+          onEnd: function(e){
+            var dx = e.clientX - downEvent.clientX;
+            var deltaDays = Math.round(dx / DAY_WIDTH);
+            var candidate = addDaysISO(node.end, deltaDays);
+            if (candidate < node.start) candidate = node.start;
+            node.end = candidate;
+            selectedId = node.id;
+            render();
+          }
+        });
+      });
+
+      track.appendChild(bar);
+      row.appendChild(track);
+      rowsWrap.appendChild(row);
+    });
+
+    // 末尾に余白スペーサー行（ドロップ領域確保のため高さを持たせる）
+    var spacerRow = document.createElement("div");
+    spacerRow.className = "gantt-row";
+    var spacerLabel = document.createElement("div");
+    spacerLabel.className = "gantt-row-label";
+    spacerLabel.style.cursor = "default";
+    spacerRow.appendChild(spacerLabel);
+    var spacerTrack = document.createElement("div");
+    spacerTrack.className = "gantt-track";
+    spacerTrack.style.width = totalWidth + "px";
+    spacerTrack.style.height = "120px";
+    spacerRow.appendChild(spacerTrack);
+    rowsWrap.appendChild(spacerRow);
+
+    // ドロップ受付オーバーレイのジオメトリをコンテンツ全体に合わせる
+    var overlay = document.getElementById("gantt-drop-overlay");
+    overlay.style.left = LABEL_COL_WIDTH + "px";
+    overlay.style.width = totalWidth + "px";
+    var contentHeight = 36 + scheduled.length * ROW_HEIGHT + 120;
+    overlay.style.height = contentHeight + "px";
+    document.getElementById("gantt-content").style.minHeight = contentHeight + "px";
+  }
+
+  /* ============================================================
+     イベント結線
+     ============================================================ */
+  function wireEvents(){
+    document.getElementById("project-name").addEventListener("input", function(e){
+      state.project.name = e.target.value;
+      trySaveLocal();
+    });
+
+    document.getElementById("btn-export").addEventListener("click", doExport);
+    document.getElementById("btn-import").addEventListener("click", function(){
+      document.getElementById("file-input").click();
+    });
+    document.getElementById("file-input").addEventListener("change", function(e){
+      var file = e.target.files && e.target.files[0];
+      if (file) doImport(file);
+      e.target.value = "";
+    });
+    document.getElementById("btn-close-import-errors").addEventListener("click", function(){
+      document.getElementById("import-errors").style.display = "none";
+    });
+
+    document.getElementById("btn-add-child").addEventListener("click", addChildToSelected);
+    document.getElementById("btn-add-child-2").addEventListener("click", addChildToSelected);
+    document.getElementById("btn-delete-node").addEventListener("click", deleteSelected);
+
+    document.getElementById("d-name").addEventListener("input", commitNameChange);
+    document.getElementById("d-start").addEventListener("change", commitDateChange);
+    document.getElementById("d-end").addEventListener("change", commitDateChange);
+
+    document.getElementById("btn-gantt-prev").addEventListener("click", function(){
+      shiftGanttWindow(-90);
+    });
+    document.getElementById("btn-gantt-next").addEventListener("click", function(){
+      shiftGanttWindow(90);
+    });
+    document.getElementById("btn-gantt-today").addEventListener("click", function(){
+      resetGanttWindowToToday();
+    });
+
+    // キャンバスの空白クリックで選択解除
+    document.getElementById("mindmap-canvas-wrap").addEventListener("pointerdown", function(e){
+      if (e.target.id === "mindmap-canvas-wrap" || e.target.id === "mindmap-canvas") {
+        selectedId = null;
+        renderMindmap();
+        renderDetail();
+      }
+    });
+  }
+
+  /* ============================================================
+     初期化
+     ============================================================ */
+  function init(){
+    var loaded = tryLoadLocal();
+    state = loaded || defaultState();
+    wireEvents();
+    render();
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
