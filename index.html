@@ -92,7 +92,7 @@
   .panel-toolbar h2{ font-size:13px; margin:0 8px 0 0; color:var(--text-dim); font-weight:600; }
 
   /* ---------- マインドマップ ---------- */
-  #mindmap-body{ flex:1; display:flex; min-height:0; }
+  #mindmap-body{ flex:1; display:flex; min-height:0; min-width:0; }
   #mindmap-canvas-wrap{
     flex:1; position:relative; overflow:auto; background:var(--bg);
     background-image: radial-gradient(var(--border) 1px, transparent 1px);
@@ -121,9 +121,9 @@
   }
   aside#detail-panel h3{ font-size:13px; margin:0 0 10px; color:var(--text-dim); }
   .field{ margin-bottom:12px; }
-  .field input[type=text]{ width:100%; }
-  .field-row{ display:flex; gap:8px; }
-  .field-row .field{ flex:1; }
+  .field input[type=text], .field input[type=date]{ width:100%; min-width:0; }
+  .field-row{ display:flex; gap:8px; min-width:0; }
+  .field-row .field{ flex:1; min-width:0; }
   #detail-empty{ color:var(--text-dim); font-size:12px; }
   .detail-actions{ display:flex; flex-direction:column; gap:6px; margin-top:14px; }
   .detail-actions button{ width:100%; }
@@ -154,7 +154,10 @@
     position:sticky; left:0; z-index:4; width:180px; flex:none;
     background:var(--panel); border-right:1px solid var(--border); border-bottom:1px solid var(--border);
   }
-  .gantt-header-dates{ position:relative; border-bottom:1px solid var(--border); }
+  /* flex-shrink:0 が無いと、親(.gantt-header / .gantt-row)の実測幅が
+     明示widthより狭い場合にtrackが縮んでしまい、横スクロールでバーが
+     切れて見える/つかめなくなる不具合が起きるため明示的に無効化する */
+  .gantt-header-dates{ position:relative; border-bottom:1px solid var(--border); flex-shrink:0; }
   .gantt-day-cell{
     position:absolute; top:0; height:36px; border-right:1px solid var(--border);
     font-size:10px; color:var(--text-dim); text-align:center; padding-top:4px;
@@ -167,11 +170,14 @@
   .gantt-row-label{
     position:sticky; left:0; z-index:2; width:180px; flex:none;
     background:var(--panel); border-right:1px solid var(--border); border-bottom:1px solid var(--border);
-    padding:8px 10px; font-size:12px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    padding:8px 10px; font-size:12px; cursor:pointer;
+    display:flex; align-items:center; gap:3px; overflow:hidden;
   }
+  .gantt-row-label .grl-branch{ color:var(--text-dim); flex:none; }
+  .gantt-row-label .grl-name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .gantt-row-label:hover{ color:var(--accent); }
   .gantt-row-label.selected{ color:var(--accent); font-weight:700; }
-  .gantt-track{ position:relative; height:40px; border-bottom:1px solid var(--border); overflow:hidden; }
+  .gantt-track{ position:relative; height:40px; border-bottom:1px solid var(--border); overflow:hidden; flex-shrink:0; }
   .gantt-bar{
     position:absolute; top:6px; height:28px; border-radius:6px;
     background:var(--accent-dim); border:1px solid var(--accent);
@@ -216,6 +222,20 @@
     color:var(--text-dim); font-size:11px;
   }
   .hidden{ display:none !important; }
+
+  /* 狭幅(スマホ想定): マインドマップ本体と詳細パネルも上下に積み、
+     日付2項目の横並び(.field-row)も縦積みにし、キャンバスは固定高さ
+     +内部スクロールにしてページ全体の巨大化を防ぐ。
+     他のルールより後に書くことで、同じ詳細度の上書きを確実にする。 */
+  @media (max-width: 480px){
+    #mindmap-body{ flex-direction:column; }
+    #mindmap-canvas-wrap{ flex:none; height:260px; }
+    aside#detail-panel{
+      width:100%; flex:none; border-left:none; border-top:1px solid var(--border);
+      max-height:280px;
+    }
+    .field-row{ flex-direction:column; gap:0; }
+  }
 </style>
 </head>
 <body>
@@ -314,7 +334,7 @@
 
 <!-- インポート検証エラー表示 -->
 <div id="import-errors">
-  <h3>インポートに失敗しました</h3>
+  <h3 id="import-errors-title">インポートに失敗しました</h3>
   <ul id="import-errors-list"></ul>
   <button id="btn-close-import-errors">閉じる</button>
 </div>
@@ -335,11 +355,19 @@
 
   /* ============================================================
      日付ユーティリティ（UTC固定でDST/タイムゾーンのズレを回避）
+     ------------------------------------------------------------
+     対応範囲: 0001-01-01 〜 9999-12-31 (ISO文字列 YYYY-MM-DD, 年は常に4桁)。
+     この範囲を超える/逸脱する入力・演算結果は MIN_DATE/MAX_DATE へ丸める。
+     日付そのものを無断で切り捨てる(値を変えてしまう)運用はせず、
+     あくまで「表示・演算上の不変条件を壊さないための安全弁」として扱う。
      ============================================================ */
+  var MIN_DATE = "0001-01-01";
+  var MAX_DATE = "9999-12-31";
   function pad2(n){ return n < 10 ? "0"+n : ""+n; }
+  function pad4(n){ var s = ""+n; while (s.length < 4) s = "0"+s; return s; }
   function todayISO(){
     var d = new Date();
-    return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate());
+    return pad4(d.getFullYear())+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate());
   }
   function isValidISODate(s){
     if (typeof s !== "string") return false;
@@ -347,21 +375,49 @@
     if (!m) return false;
     var y = +m[1], mo = +m[2], d = +m[3];
     if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
-    var dt = new Date(Date.UTC(y, mo-1, d));
+    // setUTCFullYear(y, ...) は Date.UTC()/Date() と異なり 0〜99年を
+    // 1900年代へ読み替える「2桁年特例」を適用しないため、0001〜0099年を
+    // 正しく検証できる。
+    var dt = new Date(0);
+    dt.setUTCFullYear(y, mo - 1, d);
     return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo-1 && dt.getUTCDate() === d;
   }
+  // 不正な形式の場合は null を返す(呼び出し側で必ずガードする)。
   function parseUTC(s){
-    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-    return Date.UTC(+m[1], +m[2]-1, +m[3]);
+    var m = typeof s === "string" ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(s) : null;
+    if (!m) return null;
+    var dt = new Date(0);
+    dt.setUTCFullYear(+m[1], +m[2]-1, +m[3]);
+    return dt.getTime();
   }
-  function diffDays(a, b){ return Math.round((parseUTC(b) - parseUTC(a)) / 86400000); }
+  function diffDays(a, b){
+    var ta = parseUTC(a), tb = parseUTC(b);
+    if (ta === null || tb === null) return 0; // 想定外形式: 安全側に0日差として扱う
+    return Math.round((tb - ta) / 86400000);
+  }
+  function clampISO(s){
+    if (!isValidISODate(s)) return s;
+    if (s < MIN_DATE) return MIN_DATE;
+    if (s > MAX_DATE) return MAX_DATE;
+    return s;
+  }
+  // n日加算した結果が対応範囲(0001-01-01〜9999-12-31)を超える場合は、
+  // 範囲の境界値に丸める(クラッシュ防止のための安全弁。ドラッグ操作や
+  // 期間ナビゲーションで範囲外に出てもアプリが壊れないようにするため)。
   function addDaysISO(s, n){
-    var t = parseUTC(s) + n * 86400000;
+    var base = parseUTC(s);
+    if (base === null) return s;
+    var t = base + n * 86400000;
     var dt = new Date(t);
-    return dt.getUTCFullYear()+"-"+pad2(dt.getUTCMonth()+1)+"-"+pad2(dt.getUTCDate());
+    var y = dt.getUTCFullYear();
+    if (y < 1) return MIN_DATE;
+    if (y > 9999) return MAX_DATE;
+    return pad4(y)+"-"+pad2(dt.getUTCMonth()+1)+"-"+pad2(dt.getUTCDate());
   }
   function isoWeekday(s){ // 0=日,6=土 (UTCベース)
-    return new Date(parseUTC(s)).getUTCDay();
+    var t = parseUTC(s);
+    if (t === null) return 0;
+    return new Date(t).getUTCDay();
   }
 
   function uid(){
@@ -423,6 +479,31 @@
       children(cur).forEach(function(c){ out.push(c.id); stack.push(c.id); });
     }
     return out;
+  }
+  // ルートから深さ優先(子は配置順=y座標順)で辿ったノードID順序。
+  // ガントチャートの行をこの順序に合わせることで、親タスクの直後に
+  // その子・孫タスクが並び、つながりが視覚的にわかりやすくなる。
+  function hierarchyOrder(){
+    var order = [];
+    function walk(id){
+      order.push(id);
+      children(id).slice().sort(function(a, b){ return a.y - b.y; }).forEach(function(c){ walk(c.id); });
+    }
+    var root = rootNode();
+    if (root) walk(root.id);
+    return order;
+  }
+  // ルートからそのノードまでの名前を " > " で連結したパンくず文字列。
+  // ガント行のツールチップ(title)で、どの親子ツリーに属するかを明示する。
+  function ancestorPath(node){
+    var names = [];
+    var cur = node, guard = 0;
+    while (cur && guard < state.nodes.length + 5) {
+      names.unshift(cur.name);
+      cur = cur.parentId !== null ? findNode(cur.parentId) : null;
+      guard++;
+    }
+    return names.join(" > ");
   }
 
   /* ============================================================
@@ -910,10 +991,22 @@
     // 期間ラベル表示
     document.getElementById("gantt-range-label").textContent = "表示期間: " + range.start + " 〜 " + range.end;
 
-    // 行（スケジュール済みタスク） - 現在のウィンドウと重なるものだけをDOM化する
+    // 行（スケジュール済みタスク） - 現在のウィンドウと重なるものだけをDOM化する。
+    // 親→子→孫の階層順(hierarchyOrder)に並べることで、ガント側でも
+    // タスク同士の親子関係(つながり)が視覚的に把握しやすくなる。
     var rowsWrap = document.getElementById("gantt-rows");
     rowsWrap.innerHTML = "";
-    var allScheduled = state.nodes.filter(function(n){ return n.parentId !== null && n.start && n.end; });
+    var order = hierarchyOrder();
+    var byOrder = {};
+    order.forEach(function(id, i){ byOrder[id] = i; });
+    var allScheduled = state.nodes
+      .filter(function(n){ return n.parentId !== null && n.start && n.end; })
+      .sort(function(a, b){
+        var ia = byOrder[a.id], ib = byOrder[b.id];
+        if (ia === undefined) ia = 1e9;
+        if (ib === undefined) ib = 1e9;
+        return ia - ib;
+      });
     var scheduled = allScheduled.filter(function(n){
       return n.start <= range.end && n.end >= range.start;
     });
@@ -926,9 +1019,24 @@
       var row = document.createElement("div");
       row.className = "gantt-row";
 
+      // depth: ルート直下の子=1, 孫=2, ... 。インデント幅と「└」接続記号で
+      // 親子のつながりを表現し、title(ツールチップ)にはルートからの
+      // パンくず全体("ルート > 親 > 自分")を表示する。
+      var depth = depthOf(node);
       var label = document.createElement("div");
       label.className = "gantt-row-label" + (node.id === selectedId ? " selected" : "");
-      label.textContent = node.name;
+      label.style.paddingLeft = (10 + Math.max(0, depth - 1) * 14) + "px";
+      label.title = ancestorPath(node);
+      if (depth > 1) {
+        var branch = document.createElement("span");
+        branch.className = "grl-branch";
+        branch.textContent = "└";
+        label.appendChild(branch);
+      }
+      var nameSpan = document.createElement("span");
+      nameSpan.className = "grl-name";
+      nameSpan.textContent = node.name;
+      label.appendChild(nameSpan);
       label.dataset.id = node.id;
       label.addEventListener("click", function(){
         selectedId = node.id;
@@ -942,6 +1050,7 @@
 
       var bar = document.createElement("div");
       bar.className = "gantt-bar";
+      bar.title = ancestorPath(node) + " (" + node.start + " 〜 " + node.end + ")";
       var offset = diffDays(range.start, node.start);
       var span = diffDays(node.start, node.end) + 1;
       bar.style.left = (offset * DAY_WIDTH) + "px";
@@ -960,7 +1069,10 @@
       bar.appendChild(handleR);
 
       // バー本体のドラッグ = 開始・終了日を同じ日数分シフト
-      gbLabel.addEventListener("pointerdown", function(downEvent){
+      // (gbLabelだけでなくbar全体にリスナーを付けることで、ラベル文字の
+      // 外側＝バーの大半を占める背景部分でも掴んで移動できるようにする。
+      // 左右ハンドルは stopPropagation 済みなのでここには伝播しない)
+      bar.addEventListener("pointerdown", function(downEvent){
         if (downEvent.button !== 0) return;
         downEvent.preventDefault();
         downEvent.stopPropagation();
@@ -1049,7 +1161,13 @@
     overlay.style.width = totalWidth + "px";
     var contentHeight = 36 + scheduled.length * ROW_HEIGHT + 120;
     overlay.style.height = contentHeight + "px";
-    document.getElementById("gantt-content").style.minHeight = contentHeight + "px";
+    var contentEl = document.getElementById("gantt-content");
+    contentEl.style.minHeight = contentHeight + "px";
+    // #gantt-content はブロック要素なので、明示的にwidthを指定しないと
+    // 子の.gantt-row(flex)がこのブロックの幅(=表示領域の幅)までしか
+    // 広がらず、トラックがflex-shrinkで縮められて右側が見切れ、
+    // 横スクロールも機能しなくなる。ラベル列幅+日付分の全幅を明示する。
+    contentEl.style.width = (LABEL_COL_WIDTH + totalWidth) + "px";
   }
 
   /* ============================================================
