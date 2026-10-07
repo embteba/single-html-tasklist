@@ -1,0 +1,3 @@
+# Playwright MCPによるUI検証時のスクリーンショット/ログ等の補助資材。
+# 単一HTML配布物(index.html)には含めない。
+.playwright-mcp/

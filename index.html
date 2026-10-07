@@ -511,6 +511,13 @@
      ============================================================ */
   var localStorageAvailable = true;
   function trySaveLocal(){
+    if (skipNextAutosave) {
+      // 破損データ検出直後の最初の描画だけは保存をスキップし、
+      // ユーザーがエラーを確認する前に元データを上書きしないようにする。
+      skipNextAutosave = false;
+      updateStatusText();
+      return;
+    }
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       localStorageAvailable = true;
@@ -520,15 +527,25 @@
     updateStatusText();
   }
   function tryLoadLocal(){
+    // 戻り値: { state, corrupted, errors, raw }
+    // 失敗時も生データ(raw)を保持したまま返し、呼び出し側(init)が
+    // 「エラーを利用者に明示」「正常化するまで元データを上書きしない」
+    // を実現できるようにする。
     try {
       var raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return null;
-      var parsed = JSON.parse(raw);
+      if (!raw) return { state: null, corrupted: false, errors: [], raw: raw };
+      var parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        return { state: null, corrupted: true, errors: ["JSONの構文解析に失敗しました: " + e.message], raw: raw };
+      }
       var errors = validateState(parsed);
-      if (errors.length) return null;
-      return parsed;
+      if (errors.length) return { state: null, corrupted: true, errors: errors, raw: raw };
+      return { state: parsed, corrupted: false, errors: [], raw: raw };
     } catch (e) {
-      return null;
+      // localStorage自体へのアクセス失敗 (file://等) はデータ破損ではない
+      return { state: null, corrupted: false, errors: [], raw: null };
     }
   }
   function updateStatusText(){
@@ -539,21 +556,33 @@
   }
 
   /* ---- バリデーション (Import 兼 localStorage 読込で共用) ---- */
+  // 対応スキーマバージョン。将来の互換破壊的変更に備え、ここだけを
+  // 更新すれば古い/新しいバージョンのJSONを明示的に拒否できる。
+  var SUPPORTED_SCHEMA_VERSION = 1;
   function validateState(obj){
     var errors = [];
     if (!obj || typeof obj !== "object") { errors.push("JSONがオブジェクトではありません。"); return errors; }
-    if (typeof obj.schemaVersion !== "number") errors.push("schemaVersion が数値ではありません。");
+    // schemaVersion は「対応している値(=1)」のみ受理する。999のような
+    // 未知の数値も通してしまうと将来のフォーマット変更で壊れたデータを
+    // 誤って読み込んでしまうため、数値チェックだけでなく厳密一致を見る。
+    if (obj.schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
+      errors.push("schemaVersion が未対応です（対応: " + SUPPORTED_SCHEMA_VERSION + " / 実際: " + JSON.stringify(obj.schemaVersion) + "）。");
+    }
     if (!obj.project || typeof obj.project.name !== "string") errors.push("project.name が文字列ではありません。");
     if (!Array.isArray(obj.nodes)) { errors.push("nodes が配列ではありません。"); return errors; }
     if (obj.nodes.length === 0) { errors.push("nodes が空です（ルートノードが必要です）。"); return errors; }
 
-    var ids = {};
+    // プレーンオブジェクト({})をID辞書に使うと、"toString"や"__proto__"
+    // のようなIDがObject.prototype由来のプロパティと衝突し、存在しない
+    // IDを「存在する」と誤判定する(あるいはその逆)危険があるため、
+    // 辞書にはMap/Setを用いてプロトタイプ汚染の影響を受けないようにする。
+    var ids = new Set();
     var rootCount = 0;
     obj.nodes.forEach(function(n, i){
       if (!n || typeof n !== "object") { errors.push("nodes[" + i + "] がオブジェクトではありません。"); return; }
       if (typeof n.id !== "string" || !n.id) { errors.push("nodes[" + i + "].id が不正です。"); return; }
-      if (ids[n.id]) errors.push("id の重複: " + n.id);
-      ids[n.id] = true;
+      if (ids.has(n.id)) errors.push("id の重複: " + n.id);
+      ids.add(n.id);
       if (typeof n.name !== "string") errors.push("nodes[" + i + "].name が文字列ではありません。(id=" + n.id + ")");
       if (n.parentId !== null && typeof n.parentId !== "string") errors.push("nodes[" + i + "].parentId が不正です。(id=" + n.id + ")");
       if (n.parentId === null) rootCount++;
@@ -562,7 +591,10 @@
       if (n.start && n.end && isValidISODate(n.start) && isValidISODate(n.end) && n.start > n.end) {
         errors.push("start が end より後になっています。(id=" + n.id + ")");
       }
-      if (typeof n.x !== "number" || typeof n.y !== "number") errors.push("nodes[" + i + "].x/y が数値ではありません。(id=" + n.id + ")");
+      // typeof === "number" は Infinity/-Infinity/NaN も true になり、
+      // 1e309 のような値が JSON.parse で Infinity になってすり抜けると
+      // ノードが画面外に消える不具合につながるため、有限数のみ許可する。
+      if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) errors.push("nodes[" + i + "].x/y が有限の数値ではありません。(id=" + n.id + ")");
     });
     if (errors.length) return errors;
 
@@ -570,21 +602,21 @@
 
     // 親参照の存在確認
     obj.nodes.forEach(function(n){
-      if (n.parentId !== null && !ids[n.parentId]) errors.push("存在しない parentId を参照しています。(id=" + n.id + ", parentId=" + n.parentId + ")");
+      if (n.parentId !== null && !ids.has(n.parentId)) errors.push("存在しない parentId を参照しています。(id=" + n.id + ", parentId=" + n.parentId + ")");
     });
     if (errors.length) return errors;
 
-    // 循環参照の検出
-    var byId = {};
-    obj.nodes.forEach(function(n){ byId[n.id] = n; });
+    // 循環参照の検出 (byId/seen もプロトタイプ汚染を避けるため Map/Set を使用)
+    var byId = new Map();
+    obj.nodes.forEach(function(n){ byId.set(n.id, n); });
     obj.nodes.forEach(function(n){
-      var seen = {};
+      var seen = new Set();
       var cur = n;
       var guard = 0;
       while (cur && cur.parentId !== null && guard < obj.nodes.length + 5) {
-        if (seen[cur.id]) { errors.push("循環参照を検出しました。(id=" + n.id + ")"); break; }
-        seen[cur.id] = true;
-        cur = byId[cur.parentId];
+        if (seen.has(cur.id)) { errors.push("循環参照を検出しました。(id=" + n.id + ")"); break; }
+        seen.add(cur.id);
+        cur = byId.get(cur.parentId);
         guard++;
       }
     });
@@ -605,8 +637,10 @@
     setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
   }
 
-  function showImportErrors(errors){
+  function showImportErrors(errors, title){
     var box = document.getElementById("import-errors");
+    var titleEl = document.getElementById("import-errors-title");
+    if (titleEl) titleEl.textContent = title || "インポートに失敗しました";
     var list = document.getElementById("import-errors-list");
     list.innerHTML = "";
     errors.forEach(function(msg){
@@ -678,6 +712,7 @@
   /* ---------------- マインドマップ描画 ---------------- */
   function renderMindmap(){
     var canvas = document.getElementById("mindmap-canvas");
+    fitCanvasToNodes();
     // 既存ノードDOMを除去（SVGは残す）
     canvas.querySelectorAll(".mm-node").forEach(function(el){ el.remove(); });
 
@@ -716,10 +751,13 @@
         startPointerDrag(downEvent, {
           onMove: function(e, dx, dy, moved){
             if (!moved) return;
-            node.x = origX + dx;
-            node.y = origY + dy;
+            // 負座標に出るとキャンバス外に出て二度と掴めなくなるため、
+            // ドラッグ中も常に下限(0,0)にクランプする。
+            node.x = clampNodeCoord(origX + dx, CANVAS_MIN_X);
+            node.y = clampNodeCoord(origY + dy, CANVAS_MIN_Y);
             el.style.left = node.x + "px";
             el.style.top = node.y + "px";
+            fitCanvasToNodes();
             drawMindmapLines();
           },
           onEnd: function(e, moved){
@@ -806,20 +844,57 @@
   function commitDateChange(){
     var node = selectedId ? findNode(selectedId) : null;
     if (!node || node.parentId === null) return;
-    var s = document.getElementById("d-start").value || null;
-    var e = document.getElementById("d-end").value || null;
+    var startInput = document.getElementById("d-start");
+    var endInput = document.getElementById("d-end");
+    var s = startInput.value || null;
+    var e = endInput.value || null;
     var errEl = document.getElementById("d-date-error");
+    // ネイティブ<input type=date>は10000年以降やブラウザによっては
+    // 不正な値も入力欄にセットできてしまうため、保存前に必ず
+    // isValidISODate で実在する日付かつ対応範囲(0001-9999)内かを検証する。
+    // 無効な場合は黙って補正・クランプせず、エラー表示して元の値に戻す。
+    if (s !== null && !isValidISODate(s)) {
+      errEl.textContent = "開始日が不正です（" + MIN_DATE + " 〜 " + MAX_DATE + " の範囲で指定してください）。";
+      startInput.value = node.start || "";
+      return;
+    }
+    if (e !== null && !isValidISODate(e)) {
+      errEl.textContent = "終了日が不正です（" + MIN_DATE + " 〜 " + MAX_DATE + " の範囲で指定してください）。";
+      endInput.value = node.end || "";
+      return;
+    }
     if (s && e && s > e) {
       errEl.textContent = "開始日は終了日以前にしてください。";
       // 既存値に戻す
-      document.getElementById("d-start").value = node.start || "";
-      document.getElementById("d-end").value = node.end || "";
+      startInput.value = node.start || "";
+      endInput.value = node.end || "";
       return;
     }
     errEl.textContent = "";
     node.start = s;
     node.end = e;
     render();
+  }
+
+  // マインドマップキャンバスの実座標範囲。ノードがドラッグ/追加で
+  // 負座標や極端な正方向に出てしまうと二度と掴めなくなるため、
+  // 下限(0,0)にクランプしつつ、実際のノード分布に合わせてキャンバス
+  // /SVG自体も動的に広げ、スクロールで必ず到達できるようにする。
+  var CANVAS_MIN_X = 0, CANVAS_MIN_Y = 0;
+  var CANVAS_MARGIN = 240; // ノード本体やラベルがはみ出さないための余白
+  var CANVAS_BASE_W = 2200, CANVAS_BASE_H = 1800; // 最小サイズ(初期表示用)
+  function clampNodeCoord(v, min){ return Math.max(min, Number.isFinite(v) ? v : min); }
+  function fitCanvasToNodes(){
+    var maxX = CANVAS_BASE_W, maxY = CANVAS_BASE_H;
+    state.nodes.forEach(function(n){
+      if (n.x + CANVAS_MARGIN > maxX) maxX = n.x + CANVAS_MARGIN;
+      if (n.y + CANVAS_MARGIN > maxY) maxY = n.y + CANVAS_MARGIN;
+    });
+    var canvas = document.getElementById("mindmap-canvas");
+    canvas.style.width = maxX + "px";
+    canvas.style.height = maxY + "px";
+    var svg = document.getElementById("mindmap-lines");
+    if (svg) { svg.setAttribute("width", maxX); svg.setAttribute("height", maxY); }
   }
 
   function addChildToSelected(){
@@ -832,8 +907,8 @@
       name: "新しいタスク",
       start: null,
       end: null,
-      x: parent.x + LEVEL_GAP_X,
-      y: parent.y + existingChildren.length * CHILD_GAP_Y
+      x: clampNodeCoord(parent.x + LEVEL_GAP_X, CANVAS_MIN_X),
+      y: clampNodeCoord(parent.y + existingChildren.length * CHILD_GAP_Y, CANVAS_MIN_Y)
     };
     state.nodes.push(newNode);
     selectedId = newNode.id;
@@ -1223,11 +1298,28 @@
   /* ============================================================
      初期化
      ============================================================ */
+  var skipNextAutosave = false;
   function init(){
-    var loaded = tryLoadLocal();
-    state = loaded || defaultState();
-    wireEvents();
-    render();
+    var loadResult = tryLoadLocal();
+    if (loadResult.corrupted) {
+      // 自動保存データが破損/不正だった場合、defaultState()で起動は
+      // するが、「黙って上書き」しないよう最初の1回だけ自動保存を
+      // 止め、エラーダイアログで利用者に明示する。これにより、
+      // 元の(壊れた)localStorageの内容は少なくとも今回の起動時点では
+      // 保持され、ユーザーが気づかないまま失われることを防ぐ。
+      state = defaultState();
+      skipNextAutosave = true;
+      wireEvents();
+      render();
+      showImportErrors(
+        loadResult.errors,
+        "自動保存データの読み込みに失敗しました（新規データで開始します。元の保存データはまだ上書きしていません）"
+      );
+    } else {
+      state = loadResult.state || defaultState();
+      wireEvents();
+      render();
+    }
   }
 
   init();
